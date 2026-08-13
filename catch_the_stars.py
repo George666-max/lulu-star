@@ -9,17 +9,18 @@ Gameplay:
     Start by choosing Easy / Normal / Hard
     Clear each wave by catching enough stars → pick 1 of 3 upgrades → harder waves
     Special waves: Frenzy (3/7/11…) · Boss (5/10/15…) · Shop every 3 clears
+    Shop: buy / skip (Continue) / pay to Refresh offers
     HP hits 0 → run ends. Press R or both fists to return to difficulty select
 
 Controls:
     Hand / mouse / arrows or A D   move paddle
     Menu / upgrade / shop: move hand L/C/R, thumbs-up to confirm
-    Shop: Space/Enter continue · open hand continue
-    Q / E / F                      use shop items (bomb / slow-mo / heart)
-    Or press keys 1 2 3 / click cards
+    Shop: swipe hand down → Refresh (left) or Continue (right), thumbs-up confirm
+    Shop keys: 1/2/3 buy · R refresh · Space skip/continue
+    Q E F G T                      use items (bomb/slow/heart/magnet/gold rush)
     Both fists to camera           restart (back to difficulty menu)
     H                              toggle hand control
-    R                              back to difficulty menu after game over
+    R                              refresh in shop · menu after game over
     ESC                            quit
 """
 
@@ -59,11 +60,7 @@ try:
 except Exception as exc:  # noqa: BLE001
     print(f"[Hint] Hand tracking unavailable (mouse/keyboard only): {exc}")
 
-MODEL_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "interacting_with_webcam"
-    / "hand_landmarker.task"
-)
+MODEL_PATH = Path(__file__).resolve().parent / "hand_landmarker.task"
 
 
 class HandController:
@@ -81,6 +78,10 @@ class HandController:
         self.last_thumbs_up = False
         self.last_dual_fist = False
         self.last_card_hover = None  # 1 / 2 / 3 from hand X zones
+        self.last_y_norm = None
+        self.last_shop_target = None  # 1/2/3 / "refresh" / "continue"
+        self._y_hist: list[float] = []
+        self.last_swipe_down = False
         self.last_preview = None
         self.status = "Hand: off" if not HAND_OK else "Hand: starting"
         if not HAND_OK:
@@ -162,6 +163,15 @@ class HandController:
             return 2
         return 3
 
+    def shop_target_from_hand(self, raw_x: float, raw_y: float):
+        """Upper area = offer cards; swipe/move down = Refresh / Continue."""
+        # Swipe-down or hand low → bottom actions
+        if self.last_swipe_down or raw_y > 0.58:
+            if raw_x < 0.48:
+                return "refresh"
+            return "continue"
+        return self.card_from_x(raw_x)
+
     def update(self):
         if not self.enabled or self.cap is None or self.landmarker is None:
             return None
@@ -175,16 +185,28 @@ class HandController:
         ts = int((time.time() - self.t0) * 1000)
         result = self.landmarker.detect_for_video(mp_image, ts)
         self.last_dual_fist = False
+        self.last_swipe_down = False
         if result.hand_landmarks:
             hands = result.hand_landmarks
             lms = hands[0]
             tip = lms[8]
             wrist = lms[0]
             self.last_x_norm = self.map_hand_x(tip.x)
+            self.last_y_norm = tip.y
             self.last_fingers = self.count_fingers(lms)
             self.last_thumbs_up = self.is_thumbs_up(lms)
             # Use wrist X for card hover (stable while showing thumbs-up)
             self.last_card_hover = self.card_from_x(wrist.x)
+
+            # Detect downward swipe (MediaPipe y grows downward)
+            self._y_hist.append(tip.y)
+            if len(self._y_hist) > 8:
+                self._y_hist.pop(0)
+            if len(self._y_hist) >= 5:
+                if self._y_hist[-1] - self._y_hist[0] > 0.12:
+                    self.last_swipe_down = True
+
+            self.last_shop_target = self.shop_target_from_hand(wrist.x, tip.y)
 
             fists = sum(1 for h in hands if self.is_fist(h))
             self.last_dual_fist = fists >= 2 and len(hands) >= 2
@@ -200,9 +222,13 @@ class HandController:
                 col = (0, 120, 255)
                 self.status = "Hand: both fists → restart"
             elif self.last_thumbs_up:
-                label = "THUMBS UP"
+                label = f"THUMBS → {self.last_shop_target}"
                 col = (0, 255, 0)
-                self.status = f"Hand: thumbs-up → card {self.last_card_hover}"
+                self.status = f"Hand: thumbs-up → {self.last_shop_target}"
+            elif self.last_shop_target in ("continue", "refresh"):
+                label = str(self.last_shop_target).upper()
+                col = (80, 220, 255)
+                self.status = f"Hand: highlight {self.last_shop_target}"
             else:
                 label = f"CARD {self.last_card_hover}"
                 col = (255, 220, 0)
@@ -212,7 +238,7 @@ class HandController:
                 label,
                 (10, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.75,
+                0.7,
                 col,
                 2,
             )
@@ -221,6 +247,9 @@ class HandController:
             self.last_thumbs_up = False
             self.last_dual_fist = False
             self.last_card_hover = None
+            self.last_shop_target = None
+            self.last_y_norm = None
+            self._y_hist.clear()
             self.status = "Hand: no hand detected"
         preview = cv2.cvtColor(cv2.resize(frame, (160, 120)), cv2.COLOR_BGR2RGB)
         self.last_preview = preview
@@ -544,28 +573,137 @@ TRAJECTORY_NAMES = ("straight", "sine", "drift", "zigzag")
 # 星星种类：normal 得分；gold 高分；heart 回血；bomb 接住扣血；boss 巨型
 STAR_TYPES = ("normal", "gold", "heart", "bomb", "boss")
 
-# Shop catalog (buy → inventory; use in-run with Q / E / F)
-SHOP_CATALOG = [
+# Shop pool: mix of one-shot items + mild permanent buffs (balanced)
+def _shop_buff_wide(s):
+    s["paddle_bonus"] += 10
+    _apply_paddle_size(s)
+
+
+def _shop_buff_luck(s):
+    s["luck"] = min(0.45, s["luck"] + 0.06)
+
+
+def _shop_buff_slow(s):
+    s["speed_mul"] = max(0.62, s["speed_mul"] - 0.06)
+
+
+def _shop_buff_magnet(s):
+    s["magnet"] += 55
+
+
+def _shop_buff_shield(s):
+    s["shield"] += 1
+
+
+def _shop_buff_follow(s):
+    s["hand_follow"] = min(0.32, s["hand_follow"] + 0.04)
+    s["hand_max_step"] += 2
+
+
+def _shop_buff_quota(s):
+    s["quota_cut"] = min(6, s["quota_cut"] + 1)
+
+
+SHOP_POOL = [
+    # Consumables
     {
         "id": "nuke",
+        "kind": "item",
         "name": "Star Bomb",
         "desc": "Clear falling stars (Q)",
         "price": 25,
-        "key": "Q",
     },
     {
         "id": "slow",
+        "kind": "item",
         "name": "Slow-Mo",
-        "desc": "Stars crawl for 5s (E)",
-        "price": 30,
-        "key": "E",
+        "desc": "Stars crawl 5s (E)",
+        "price": 28,
     },
     {
         "id": "heart",
+        "kind": "item",
         "name": "Heart Pack",
-        "desc": "Heal 1 HP when used (F)",
-        "price": 35,
-        "key": "F",
+        "desc": "Heal 1 HP (F)",
+        "price": 32,
+    },
+    {
+        "id": "ghost",
+        "kind": "item",
+        "name": "Ghost Veil",
+        "desc": "Ignore next miss (auto)",
+        "price": 38,
+    },
+    {
+        "id": "magnet_pulse",
+        "kind": "item",
+        "name": "Magnet Burst",
+        "desc": "Strong pull 4s (G)",
+        "price": 26,
+    },
+    {
+        "id": "gold_rush",
+        "kind": "item",
+        "name": "Gold Rush",
+        "desc": "1.5x score for 6s (T)",
+        "price": 34,
+    },
+    # Mild permanent buffs (weaker than upgrade cards)
+    {
+        "id": "buff_wide",
+        "kind": "buff",
+        "name": "Grip Tape",
+        "desc": "Paddle a bit wider",
+        "price": 40,
+        "fn": _shop_buff_wide,
+    },
+    {
+        "id": "buff_luck",
+        "kind": "buff",
+        "name": "Lucky Charm",
+        "desc": "Slightly luckier stars",
+        "price": 42,
+        "fn": _shop_buff_luck,
+    },
+    {
+        "id": "buff_slow",
+        "kind": "buff",
+        "name": "Molasses",
+        "desc": "Stars a bit slower",
+        "price": 48,
+        "fn": _shop_buff_slow,
+    },
+    {
+        "id": "buff_magnet",
+        "kind": "buff",
+        "name": "Fridge Magnet",
+        "desc": "Weak star pull",
+        "price": 44,
+        "fn": _shop_buff_magnet,
+    },
+    {
+        "id": "buff_shield",
+        "kind": "buff",
+        "name": "Tin Shield",
+        "desc": "+1 shield charge",
+        "price": 52,
+        "fn": _shop_buff_shield,
+    },
+    {
+        "id": "buff_follow",
+        "kind": "buff",
+        "name": "Steady Aim",
+        "desc": "Smoother hand aim",
+        "price": 30,
+        "fn": _shop_buff_follow,
+    },
+    {
+        "id": "buff_quota",
+        "kind": "buff",
+        "name": "Short Cut",
+        "desc": "Wave goal -1",
+        "price": 36,
+        "fn": _shop_buff_quota,
     },
 ]
 
@@ -905,9 +1043,20 @@ def reset_run(hand_enabled: bool = True, difficulty_key: str = "normal"):
         "fist_hold": 0,
         "wave_kind": "normal",
         "frenzy_timer": 0,
-        "items": {"nuke": 0, "slow": 0, "heart": 0},
+        "items": {
+            "nuke": 0,
+            "slow": 0,
+            "heart": 0,
+            "ghost": 0,
+            "magnet_pulse": 0,
+            "gold_rush": 0,
+        },
         "slowmo_timer": 0,
+        "magnet_pulse_timer": 0,
+        "gold_rush_timer": 0,
         "shop_rects": [],
+        "shop_offers": [],
+        "shop_refresh_count": 0,
         "pending_splits": [],
     }
     begin_wave(state)
@@ -947,9 +1096,20 @@ def new_menu(hand_enabled: bool = True):
         "shield": 0,
         "wave_kind": "normal",
         "frenzy_timer": 0,
-        "items": {"nuke": 0, "slow": 0, "heart": 0},
+        "items": {
+            "nuke": 0,
+            "slow": 0,
+            "heart": 0,
+            "ghost": 0,
+            "magnet_pulse": 0,
+            "gold_rush": 0,
+        },
         "slowmo_timer": 0,
+        "magnet_pulse_timer": 0,
+        "gold_rush_timer": 0,
         "shop_rects": [],
+        "shop_offers": [],
+        "shop_refresh_count": 0,
         "pending_splits": [],
     }
 
@@ -996,6 +1156,8 @@ def _refill_stars(state):
 def enter_shop(state):
     state["mode"] = "shop"
     state["stars"].clear()
+    state["shop_offers"] = roll_shop_offers(3)
+    state["shop_refresh_count"] = 0
     state["flash"] = (f"Shop — Wave {state['wave']} clear!", 50)
     state["gesture_hold"] = 0
     state["gesture_hold_id"] = None
@@ -1016,26 +1178,62 @@ def enter_upgrade(state):
     sfx.play_wave()
 
 
+def roll_shop_offers(n: int = 3) -> list[dict]:
+    pool = list(SHOP_POOL)
+    return random.sample(pool, k=min(n, len(pool)))
+
+
 def shop_price(item: dict, wave: int) -> int:
-    return item["price"] + max(0, (wave - 3) // 3) * 5
+    return item["price"] + max(0, (wave - 3) // 3) * 4
+
+
+def shop_refresh_price(state) -> int:
+    base = 12 + max(0, (state["wave"] - 3) // 3) * 4
+    return base + state.get("shop_refresh_count", 0) * 8
 
 
 def buy_shop_item(state, index: int):
     if state["mode"] != "shop":
         return
-    if index < 0 or index >= len(SHOP_CATALOG):
+    offers = state.get("shop_offers") or []
+    if index < 0 or index >= len(offers):
         return
-    item = SHOP_CATALOG[index]
+    item = offers[index]
+    if item.get("sold"):
+        state["flash"] = ("Already bought!", 30)
+        return
     price = shop_price(item, state["wave"])
     if state["score"] < price:
         state["flash"] = (f"Need {price} score!", 35)
         sfx.play_hit()
         return
     state["score"] -= price
-    state["items"][item["id"]] = state["items"].get(item["id"], 0) + 1
-    state["flash"] = (f"Bought {item['name']}!", 40)
+    if item.get("kind") == "buff":
+        item["fn"](state)
+        state["upgrades_taken"].append(f"shop:{item['id']}")
+        state["flash"] = (f"Buff: {item['name']}!", 45)
+    else:
+        state["items"][item["id"]] = state["items"].get(item["id"], 0) + 1
+        state["flash"] = (f"Bought {item['name']}!", 40)
+    item["sold"] = True
     add_popup(state, f"-{price}", (WIDTH // 2, HEIGHT // 2), ORANGE, size="med")
     sfx.play_gold()
+
+
+def refresh_shop(state):
+    if state["mode"] != "shop":
+        return
+    cost = shop_refresh_price(state)
+    if state["score"] < cost:
+        state["flash"] = (f"Refresh needs {cost}!", 35)
+        sfx.play_hit()
+        return
+    state["score"] -= cost
+    state["shop_refresh_count"] = state.get("shop_refresh_count", 0) + 1
+    state["shop_offers"] = roll_shop_offers(3)
+    state["flash"] = (f"Refreshed (−{cost})", 40)
+    add_popup(state, f"-{cost}", (WIDTH // 2, HEIGHT // 2 + 30), HINT, size="sm")
+    sfx.play_click()
 
 
 def leave_shop(state):
@@ -1052,6 +1250,7 @@ def leave_shop(state):
     state["star_accel"] = min(0.16, preset["accel"] + state["wave"] * 0.01)
     state["mode"] = "playing"
     state["shop_rects"] = []
+    state["shop_offers"] = []
     state["gesture_hold"] = 0
     state["gesture_hold_id"] = None
     state["gesture_hover"] = None
@@ -1066,7 +1265,6 @@ def use_item(state, item_id: str):
         return
     if item_id == "nuke":
         state["items"]["nuke"] -= 1
-        # Clear non-boss stars; bombs vanish safely
         cleared = 0
         kept = []
         for star in state["stars"]:
@@ -1092,6 +1290,16 @@ def use_item(state, item_id: str):
         state["hp"] += 1
         state["flash"] = ("+1 HP!", 35)
         sfx.play_heal()
+    elif item_id == "magnet_pulse":
+        state["items"]["magnet_pulse"] -= 1
+        state["magnet_pulse_timer"] = 4 * FPS
+        state["flash"] = ("Magnet Burst!", 40)
+        sfx.play_wave()
+    elif item_id == "gold_rush":
+        state["items"]["gold_rush"] -= 1
+        state["gold_rush_timer"] = 6 * FPS
+        state["flash"] = ("Gold Rush 1.5x!", 40)
+        sfx.play_gold()
 
 
 def grant_boss_drop(state):
@@ -1312,42 +1520,40 @@ def try_fist_restart(state, hand: HandController):
 
 
 def update_shop_gesture(state, hand: HandController):
-    """Shop: L/C/R + thumbs-up to buy; open hand (4 fingers) to continue."""
+    """Shop: highlight cards / refresh / continue; thumbs-up confirms."""
     if state["mode"] != "shop":
         return
     if not (state["hand_enabled"] and hand.enabled):
         return
-    if hand.last_fingers >= 4 and not hand.last_thumbs_up and not hand.last_dual_fist:
-        key = ("shop_go", 0)
-        if state["gesture_hold_id"] == key:
-            state["gesture_hold"] += 1
-        else:
-            state["gesture_hold_id"] = key
-            state["gesture_hold"] = 1
-        state["gesture_hover"] = None
-        if state["gesture_hold"] >= 14:
-            leave_shop(state)
-        return
+
+    target = hand.last_shop_target
+    # Keep highlight while confirming with thumbs-up
     if hand.last_thumbs_up:
-        if state["gesture_hover"] not in (1, 2, 3):
-            state["gesture_hover"] = hand.last_card_hover
+        if state["gesture_hover"] is None:
+            state["gesture_hover"] = target
     else:
-        state["gesture_hover"] = hand.last_card_hover
-    if hand.last_thumbs_up and state["gesture_hover"] in (1, 2, 3):
-        key = ("shop_buy", state["gesture_hover"])
+        state["gesture_hover"] = target
+
+    hover = state["gesture_hover"]
+    if hand.last_thumbs_up and hover is not None:
+        key = ("shop", hover)
         if state["gesture_hold_id"] == key:
             state["gesture_hold"] += 1
         else:
             state["gesture_hold_id"] = key
             state["gesture_hold"] = 1
         if state["gesture_hold"] >= 12:
-            buy_shop_item(state, state["gesture_hover"] - 1)
+            if hover in (1, 2, 3):
+                buy_shop_item(state, hover - 1)
+            elif hover == "refresh":
+                refresh_shop(state)
+            elif hover == "continue":
+                leave_shop(state)
             state["gesture_hold"] = 0
             state["gesture_hold_id"] = None
     else:
-        if not (isinstance(state.get("gesture_hold_id"), tuple) and state["gesture_hold_id"][0] == "shop_go"):
-            state["gesture_hold"] = 0
-            state["gesture_hold_id"] = None
+        state["gesture_hold"] = 0
+        state["gesture_hold_id"] = None
 
 
 def on_wave_clear(state):
@@ -1483,6 +1689,10 @@ def update_playing(state, move_left, move_right, control_x=None, from_hand=False
 
     if state.get("slowmo_timer", 0) > 0:
         state["slowmo_timer"] -= 1
+    if state.get("magnet_pulse_timer", 0) > 0:
+        state["magnet_pulse_timer"] -= 1
+    if state.get("gold_rush_timer", 0) > 0:
+        state["gold_rush_timer"] -= 1
 
     # Frenzy ends by timer
     if state.get("wave_kind") == "frenzy":
@@ -1503,7 +1713,13 @@ def update_playing(state, move_left, move_right, control_x=None, from_hand=False
         fall *= 1.15  # a bit faster rain
 
     frenzy = state.get("wave_kind") == "frenzy"
-    score_mul = state["score_mult"] * (2 if frenzy else 1)
+    score_mul = float(state["score_mult"]) * (2.0 if frenzy else 1.0)
+    if state.get("gold_rush_timer", 0) > 0:
+        score_mul *= 1.5
+
+    magnet = state["magnet"]
+    if state.get("magnet_pulse_timer", 0) > 0:
+        magnet = magnet + 220
 
     quota = wave_quota_for(state)
     paddle = state["paddle"]
@@ -1512,7 +1728,7 @@ def update_playing(state, move_left, move_right, control_x=None, from_hand=False
     state["pending_splits"] = []
 
     for star in state["stars"]:
-        step_star(star, fall, paddle, state["magnet"])
+        step_star(star, fall, paddle, magnet)
 
         if paddle.colliderect(star["rect"]):
             st = star["stype"]
@@ -1524,7 +1740,7 @@ def update_playing(state, move_left, move_right, control_x=None, from_hand=False
                 spawn_burst(state, pos, ORANGE, 18)
                 spawn_burst(state, pos, RED, 8)
             elif st == "boss":
-                gained = 20 * score_mul
+                gained = int(20 * score_mul)
                 state["score"] += gained
                 state["caught_in_wave"] = max(state["caught_in_wave"] + 1, quota)
                 state["combo"] += 1
@@ -1545,20 +1761,20 @@ def update_playing(state, move_left, move_right, control_x=None, from_hand=False
             elif st == "heart":
                 if state["hp"] < state["hp_max"]:
                     state["hp"] += 1
-                gained = 1 * score_mul
+                gained = int(1 * score_mul)
                 state["score"] += gained
                 state["caught_in_wave"] += 1
                 state["combo"] += 1
                 state["flash"] = ("Heal!", 30)
                 juice_catch(state, pos, gained, "heart")
             elif st == "gold":
-                gained = 3 * score_mul
+                gained = int(3 * score_mul)
                 state["score"] += gained
                 state["caught_in_wave"] += 1
                 state["combo"] += 1
                 juice_catch(state, pos, gained, "gold")
             else:
-                gained = 1 * score_mul
+                gained = int(1 * score_mul)
                 state["score"] += gained
                 state["caught_in_wave"] += 1
                 state["combo"] += 1
@@ -1569,8 +1785,12 @@ def update_playing(state, move_left, move_right, control_x=None, from_hand=False
             if star["stype"] == "bomb":
                 pass
             elif frenzy:
-                # Frenzy: free miss
                 pass
+            elif state["items"].get("ghost", 0) > 0:
+                state["items"]["ghost"] -= 1
+                state["flash"] = ("Ghost saved you!", 35)
+                add_popup(state, "SAVED", star["rect"].center, PURPLE, size="med")
+                sfx.play_shield()
             else:
                 take_damage(state, 1)
             continue
@@ -1734,84 +1954,108 @@ def draw_shop(state):
     screen.blit(overlay, (0, 0))
 
     title = big_font.render("Shop", True, GOLD)
-    screen.blit(title, title.get_rect(center=(WIDTH // 2, 56)))
+    screen.blit(title, title.get_rect(center=(WIDTH // 2, 48)))
     sub = small_font.render(
-        f"Score {state['score']}  — buy with 1/2/3 or thumbs-up",
+        f"Score {state['score']}   Skip free · Refresh costs score",
         True,
         HINT,
     )
-    screen.blit(sub, sub.get_rect(center=(WIDTH // 2, 100)))
-    tip = small_font.render("Space / Enter / open hand → Continue", True, GREEN)
-    screen.blit(tip, tip.get_rect(center=(WIDTH // 2, 124)))
+    screen.blit(sub, sub.get_rect(center=(WIDTH // 2, 88)))
+    tip = small_font.render(
+        "Swipe down → Refresh/Continue, thumbs-up to confirm",
+        True,
+        GREEN,
+    )
+    screen.blit(tip, tip.get_rect(center=(WIDTH // 2, 112)))
 
     items = state.get("items", {})
     inv = small_font.render(
-        f"Bag: Q×{items.get('nuke', 0)}  E×{items.get('slow', 0)}  F×{items.get('heart', 0)}",
+        f"Bag Q{items.get('nuke', 0)} E{items.get('slow', 0)} F{items.get('heart', 0)} "
+        f"Ghost{items.get('ghost', 0)} G{items.get('magnet_pulse', 0)} T{items.get('gold_rush', 0)}",
         True,
         WHITE,
     )
-    screen.blit(inv, inv.get_rect(center=(WIDTH // 2, 148)))
+    screen.blit(inv, inv.get_rect(center=(WIDTH // 2, 136)))
 
-    if state.get("gesture_hover") in (1, 2, 3):
-        confirming = (
-            isinstance(state.get("gesture_hold_id"), tuple)
-            and state["gesture_hold_id"][0] == "shop_buy"
-        )
-        pct = min(1.0, state.get("gesture_hold", 0) / 12) if confirming else 0.0
-        bar = pygame.Rect(WIDTH // 2 - 80, 162, 160, 8)
-        pygame.draw.rect(screen, (40, 50, 70), bar, border_radius=4)
-        if pct > 0:
-            fill = bar.copy()
-            fill.width = int(160 * pct)
-            pygame.draw.rect(screen, GOLD, fill, border_radius=4)
-
-    if (
+    hover = state.get("gesture_hover")
+    confirming = (
         isinstance(state.get("gesture_hold_id"), tuple)
-        and state["gesture_hold_id"][0] == "shop_go"
-    ):
-        pct = min(1.0, state.get("gesture_hold", 0) / 14)
-        bar = pygame.Rect(WIDTH // 2 - 80, 162, 160, 8)
+        and state["gesture_hold_id"][0] == "shop"
+        and state.get("gesture_hold", 0) > 0
+    )
+    if confirming:
+        pct = min(1.0, state.get("gesture_hold", 0) / 12)
+        bar = pygame.Rect(WIDTH // 2 - 80, 154, 160, 8)
         pygame.draw.rect(screen, (40, 50, 70), bar, border_radius=4)
         fill = bar.copy()
         fill.width = int(160 * pct)
-        pygame.draw.rect(screen, GREEN, fill, border_radius=4)
+        pygame.draw.rect(screen, GOLD, fill, border_radius=4)
 
     state["shop_rects"] = []
-    card_w, card_h = 140, 200
+    offers = state.get("shop_offers") or []
+    card_w, card_h = 140, 190
     gap = 16
     total_w = 3 * card_w + 2 * gap
     start_x = (WIDTH - total_w) // 2
-    y = 185
-    for i, item in enumerate(SHOP_CATALOG):
+    y = 170
+    for i, item in enumerate(offers):
         x = start_x + i * (card_w + gap)
         rect = pygame.Rect(x, y, card_w, card_h)
         state["shop_rects"].append(rect)
         price = shop_price(item, state["wave"])
-        afford = state["score"] >= price
-        hover = state.get("gesture_hover") == i + 1
-        border = GREEN if hover else (CARD_BORDER if afford else (90, 70, 70))
+        sold = item.get("sold", False)
+        afford = (not sold) and state["score"] >= price
+        is_hover = hover == i + 1
+        border = GREEN if is_hover else (CARD_BORDER if afford else (90, 70, 70))
         pygame.draw.rect(screen, CARD_BG, rect, border_radius=12)
-        pygame.draw.rect(screen, border, rect, 3 if hover else 2, border_radius=12)
-        screen.blit(font.render(str(i + 1), True, GREEN), (x + 12, y + 10))
+        pygame.draw.rect(screen, border, rect, 3 if is_hover else 2, border_radius=12)
+        screen.blit(font.render(str(i + 1), True, GREEN), (x + 12, y + 8))
+        kind_c = PURPLE if item.get("kind") == "buff" else HINT
+        screen.blit(
+            small_font.render("BUFF" if item.get("kind") == "buff" else "ITEM", True, kind_c),
+            (x + 40, y + 12),
+        )
         name = small_font.render(item["name"], True, WHITE if afford else HINT)
-        screen.blit(name, name.get_rect(centerx=rect.centerx, y=y + 48))
+        screen.blit(name, name.get_rect(centerx=rect.centerx, y=y + 42))
         words = item["desc"].split()
         line1 = " ".join(words[:3])
         line2 = " ".join(words[3:])
         d1 = small_font.render(line1, True, HINT)
-        screen.blit(d1, d1.get_rect(centerx=rect.centerx, y=y + 90))
+        screen.blit(d1, d1.get_rect(centerx=rect.centerx, y=y + 78))
         if line2:
             d2 = small_font.render(line2, True, HINT)
-            screen.blit(d2, d2.get_rect(centerx=rect.centerx, y=y + 112))
-        pr = font.render(f"{price} pts", True, GOLD if afford else RED)
-        screen.blit(pr, pr.get_rect(centerx=rect.centerx, y=y + 150))
+            screen.blit(d2, d2.get_rect(centerx=rect.centerx, y=y + 98))
+        if sold:
+            pr = font.render("SOLD", True, RED)
+        else:
+            pr = font.render(f"{price} pts", True, GOLD if afford else RED)
+        screen.blit(pr, pr.get_rect(centerx=rect.centerx, y=y + 140))
 
-    cont = pygame.Rect(WIDTH // 2 - 100, 420, 200, 44)
+    refresh_cost = shop_refresh_price(state)
+    ref = pygame.Rect(40, 400, 190, 48)
+    cont = pygame.Rect(WIDTH - 230, 400, 190, 48)
+    state["shop_rects"].append(ref)
     state["shop_rects"].append(cont)
+
+    ref_hover = hover == "refresh"
+    cont_hover = hover == "continue"
+    pygame.draw.rect(screen, (70, 55, 40), ref, border_radius=10)
+    pygame.draw.rect(
+        screen, ORANGE if ref_hover else (180, 140, 80), ref, 3 if ref_hover else 2, border_radius=10
+    )
+    rt = small_font.render(f"Refresh  {refresh_cost} pts", True, WHITE)
+    screen.blit(rt, rt.get_rect(center=ref.center))
+    rkey = small_font.render("R / swipe L + thumb", True, HINT)
+    screen.blit(rkey, rkey.get_rect(centerx=ref.centerx, y=ref.bottom + 4))
+
     pygame.draw.rect(screen, (40, 90, 60), cont, border_radius=10)
-    pygame.draw.rect(screen, GREEN, cont, 2, border_radius=10)
+    pygame.draw.rect(
+        screen, GREEN if cont_hover else (80, 180, 100), cont, 3 if cont_hover else 2, border_radius=10
+    )
     ct = font.render("Continue", True, WHITE)
     screen.blit(ct, ct.get_rect(center=cont.center))
+    ckey = small_font.render("Space / swipe R + thumb", True, HINT)
+    screen.blit(ckey, ckey.get_rect(centerx=cont.centerx, y=cont.bottom + 4))
 
 
 def draw_menu(state):
@@ -1924,6 +2168,8 @@ def draw(state, hand: HandController):
     else:
         progress = f"{state['caught_in_wave']}/{quota}"
     mul_txt = state["score_mult"] * (2 if kind == "frenzy" else 1)
+    if state.get("gold_rush_timer", 0) > 0:
+        mul_txt = round(mul_txt * 1.5, 1)
     lines = [
         f"Wave {state['wave']}  {progress}  [{diff_label}] {kind_tag}",
         f"Score {state['score']}  x{mul_txt}  Combo {state.get('combo', 0)}",
@@ -1948,10 +2194,15 @@ def draw(state, hand: HandController):
 
     items = state.get("items", {})
     bag = (
-        f"Items  Q:{items.get('nuke', 0)}  E:{items.get('slow', 0)}  F:{items.get('heart', 0)}"
+        f"Q{items.get('nuke', 0)} E{items.get('slow', 0)} F{items.get('heart', 0)} "
+        f"Gh{items.get('ghost', 0)} G{items.get('magnet_pulse', 0)} T{items.get('gold_rush', 0)}"
     )
     if state.get("slowmo_timer", 0) > 0:
-        bag += f"  SLOW {state['slowmo_timer'] // FPS + 1}s"
+        bag += f"  SLOW{state['slowmo_timer'] // FPS + 1}"
+    if state.get("magnet_pulse_timer", 0) > 0:
+        bag += "  MAG"
+    if state.get("gold_rush_timer", 0) > 0:
+        bag += "  RUSH"
     screen.blit(small_font.render(bag, True, HINT), (14, 86))
 
     legend = small_font.render(
@@ -2117,6 +2368,8 @@ def main():
                             hand.status = "Hand: off (press H)"
                     if event.key == pygame.K_r and state["mode"] == "game_over":
                         state = new_menu(hand_enabled=state["hand_enabled"])
+                    elif event.key == pygame.K_r and state["mode"] == "shop":
+                        refresh_shop(state)
                     if state["mode"] == "upgrade":
                         if event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
                             apply_choice(state, event.key - pygame.K_1)
@@ -2132,6 +2385,10 @@ def main():
                             use_item(state, "slow")
                         if event.key == pygame.K_f:
                             use_item(state, "heart")
+                        if event.key == pygame.K_g:
+                            use_item(state, "magnet_pulse")
+                        if event.key == pygame.K_t:
+                            use_item(state, "gold_rush")
                     if state["mode"] == "menu":
                         if event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
                             state = start_difficulty(
@@ -2152,12 +2409,15 @@ def main():
                     elif state["mode"] == "shop":
                         rects = state.get("shop_rects", [])
                         for i, rect in enumerate(rects):
-                            if rect.collidepoint(event.pos):
-                                if i < 3:
-                                    buy_shop_item(state, i)
-                                else:
-                                    leave_shop(state)
-                                break
+                            if not rect.collidepoint(event.pos):
+                                continue
+                            if i < 3:
+                                buy_shop_item(state, i)
+                            elif i == 3:
+                                refresh_shop(state)
+                            else:
+                                leave_shop(state)
+                            break
                     elif state["mode"] == "menu":
                         for i, rect in enumerate(state.get("menu_rects", [])):
                             if rect.collidepoint(event.pos):

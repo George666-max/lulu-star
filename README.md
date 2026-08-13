@@ -1,4 +1,4 @@
-# lulunailon — Catch the Stars
+# lulu-star — Catch the Stars
 
 Hand-controlled roguelike catching game (pygame + MediaPipe).
 
